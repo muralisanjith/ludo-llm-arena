@@ -1,5 +1,6 @@
 import json
 import random
+import time
 
 from arena.llm import LLM
 
@@ -16,28 +17,33 @@ class Player:
         self.opportunities = ""
         self.strategy = ""
         self.used_fallback = False
+        self.last_failure_stage = None
+        self.last_failure_reason = None
 
     def system(self, board) -> str:
         legal_moves = board.legal_moves()
+        sample_token = legal_moves[0] if legal_moves else 0
         return f"""You are playing Ludo as {self.color}. Players: Red, Green, Yellow, Blue, each a different AI model, each with 4 tokens.
 Rules: a token leaves base only on a roll of 6. Rolling a 6 grants an extra turn; three 6s in a row forfeits the turn. Landing on a lone opponent token on a non-safe square sends it back to base. Safe squares are the 4 start squares and 4 star squares. A token needs the exact roll to reach the finish. First to bring all 4 tokens home wins.
 The dice has already been rolled for you: it shows {board.dice}.
 You must pick one token id from these legal moves: {legal_moves}.
 Each of threats, opportunities, and strategy MUST be ONE short sentence, no more than 12-15 words. Do not write multiple sentences or lists in any field.
+Your ENTIRE response must be ONLY the JSON object. Do not include any text, explanation, or markdown code fences before or after it.
 You should respond in JSON according to this spec:
 {{
     "threats": "one short sentence or None",
     "opportunities": "one short sentence",
     "strategy": "one short sentence thought process",
-    "token": "one id from this list of legal moves: {legal_moves}"
+    "token": {sample_token}
 }}
-You must pick one of these ids for your token: {legal_moves}
+The "token" field must be an integer from your legal moves list: {legal_moves}.
 """
 
     def user(self, board) -> str:
         legal_moves = board.legal_moves()
         board_json = board.json()
         board_alt = board.alternative()
+        sample_token = legal_moves[0] if legal_moves else 0
 
         return f"""You are {self.color}. Your dice roll is {board.dice}.
 Legal moves (token IDs you can choose from): {legal_moves}
@@ -53,7 +59,7 @@ Respond ONLY with a JSON object matching this exact spec:
     "threats": "one short sentence or None",
     "opportunities": "one short sentence",
     "strategy": "one short sentence thought process",
-    "token": "one id from this list of legal moves: {legal_moves}"
+    "token": {sample_token}
 }}
 
 Example 1:
@@ -61,38 +67,73 @@ Example 1:
     "threats": "None.",
     "opportunities": "Advance Token 0.",
     "strategy": "Move Token 0 forward with dice roll.",
-    "token": "{legal_moves[0] if legal_moves else 0}"
+    "token": {sample_token}
 }}
 
 Example 2:
 {{
-    "threats": "Yellow token is 4 squares behind.",
-    "opportunities": "Capture opportunity on track.",
-    "strategy": "Select Token 1 to execute capture.",
-    "token": "{legal_moves[0] if legal_moves else 0}"
+    "threats": "Opponent token is nearby.",
+    "opportunities": "Safe square within reach.",
+    "strategy": "Advance active piece to safe zone.",
+    "token": {sample_token}
 }}
 
+Remember: The JSON must have exactly the fields "threats", "opportunities", "strategy", and "token".
+The "token" field must be an integer from your legal moves list: {legal_moves}.
+Your ENTIRE response must be ONLY the JSON object. Do not include any text, explanation, or markdown code fences before or after it.
 Now make your decision.
 """
 
     def _parse_response(self, text: str):
-        # Extract JSON if enclosed in markdown code blocks
-        clean_text = text.strip()
-        if "```json" in clean_text:
-            clean_text = clean_text.split("```json")[1].split("```")[0].strip()
-        elif "```" in clean_text:
-            clean_text = clean_text.split("```")[1].split("```")[0].strip()
+        if not text or not isinstance(text, str) or not text.strip():
+            raise ValueError("empty_response: Model returned empty or whitespace text")
 
+        clean_text = text.strip()
+
+        # a) Strip markdown code fences (```json ... ``` or ``` ... ```)
+        if "```" in clean_text:
+            lines = clean_text.splitlines()
+            filtered = []
+            for line in lines:
+                stripped = line.strip()
+                if stripped.startswith("```"):
+                    continue
+                filtered.append(line)
+            fence_stripped = "\n".join(filtered).strip()
+            if fence_stripped:
+                clean_text = fence_stripped
+
+        # Try parsing directly
         try:
             return json.loads(clean_text)
         except json.JSONDecodeError:
-            # Fallback: extract substring between first '{' and last '}'
-            start = clean_text.find("{")
-            end = clean_text.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                json_str = clean_text[start : end + 1]
-                return json.loads(json_str)
-            raise
+            pass
+
+        # b) If string doesn't start with '{' or has preamble/trailing text,
+        # extract substring between first '{' and last '}'
+        start = clean_text.find("{")
+        end = clean_text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            json_substr = clean_text[start : end + 1]
+            try:
+                return json.loads(json_substr)
+            except json.JSONDecodeError:
+                pass
+
+        # Also try on original text in case fence stripping altered something
+        start_orig = text.find("{")
+        end_orig = text.rfind("}")
+        if start_orig != -1 and end_orig != -1 and end_orig > start_orig:
+            json_substr_orig = text[start_orig : end_orig + 1]
+            try:
+                return json.loads(json_substr_orig)
+            except json.JSONDecodeError as err:
+                raise ValueError(f"raw_truncation: Unterminated or invalid JSON substring ({err})")
+
+        if "{" not in text or "}" not in text:
+            raise ValueError("non_json_preamble: No JSON object brackets found in response")
+
+        raise ValueError(f"malformed_json: Could not parse JSON from response: {repr(clean_text[:100])}")
 
     def process_move(self, board) -> bool:
         legal_moves = board.legal_moves()
@@ -100,50 +141,117 @@ Now make your decision.
             return False
 
         self.used_fallback = False
+        self.last_failure_stage = None
+        self.last_failure_reason = None
         sys_prompt = self.system(board)
         usr_prompt = self.user(board)
 
-        # Attempt 1
         data = None
         raw_response = ""
-        try:
-            raw_response = self.llm.chat(sys_prompt, usr_prompt, max_tokens=600)
-            data = self._parse_response(raw_response)
-        except Exception as e:
-            # Attempt 2: Retry with error feedback
-            retry_usr = usr_prompt + f"\n\nPrevious attempt failed with error: {str(e)}. Please return valid JSON matching the spec."
+        max_attempts = 3
+        curr_usr_prompt = usr_prompt
+
+        failure_stage = None
+        failure_reason = None
+
+        for attempt in range(1, max_attempts + 1):
             try:
-                raw_response = self.llm.chat(sys_prompt, retry_usr, max_tokens=600)
+                raw_response = self.llm.chat(sys_prompt, curr_usr_prompt, max_tokens=1000)
                 data = self._parse_response(raw_response)
-            except Exception as e2:
-                print(f"[Player {self.color}] Error processing move for {self.model}: {e2}")
-                if raw_response:
-                    print(f"[Player {self.color}] Raw response was: {repr(raw_response)}")
 
-        # Validate parsed data and token choice
-        token_choice = None
-        if data and isinstance(data, dict):
-            self.threats = str(data.get("threats", ""))
-            self.opportunities = str(data.get("opportunities", ""))
-            self.strategy = str(data.get("strategy", ""))
+                if not isinstance(data, dict):
+                    failure_stage = "bad_field_name"
+                    failure_reason = f"Response parsed but is not a dict: {type(data)}"
+                    raise ValueError(failure_reason)
 
-            raw_token = data.get("token")
-            try:
-                cand_token = int(raw_token)
-                if cand_token in legal_moves:
-                    token_choice = cand_token
-            except (ValueError, TypeError):
-                pass
+                # Validate token choice
+                raw_token = data.get("token")
+                try:
+                    cand_token = int(raw_token)
+                except (ValueError, TypeError):
+                    failure_stage = "illegal_token"
+                    failure_reason = f"Token field {repr(raw_token)} cannot be converted to integer"
+                    raise ValueError(failure_reason)
 
-        # Fallback if invalid JSON or illegal token choice
-        if token_choice is None:
-            self.used_fallback = True
-            token_choice = random.choice(legal_moves)
-            if not self.threats:
-                self.threats = "None."
-            if not self.opportunities:
-                self.opportunities = "Advance active token."
-            self.strategy = "Played the best available move."
+                if cand_token not in legal_moves:
+                    failure_stage = "illegal_token"
+                    failure_reason = f"Token {cand_token} is not in legal moves {legal_moves}"
+                    raise ValueError(failure_reason)
+
+                # Successfully parsed and validated!
+                token_choice = cand_token
+                self.threats = str(data.get("threats", ""))
+                self.opportunities = str(data.get("opportunities", ""))
+                self.strategy = str(data.get("strategy", ""))
+                return board.move(token_choice)
+
+            except Exception as e:
+                err_msg = str(e)
+                if failure_stage is None:
+                    err_lower = err_msg.lower()
+                    if any(term in err_lower for term in ["rate limit", "429", "too many requests", "quota", "resource_exhausted", "timeout", "timed out", "503", "502"]):
+                        failure_stage = "api_level_error"
+                        failure_reason = err_msg
+                    elif "raw_truncation" in err_msg or "unterminated string" in err_lower or "expecting" in err_lower:
+                        failure_stage = "raw_truncation"
+                        failure_reason = err_msg
+                    elif "non_json_preamble" in err_msg:
+                        failure_stage = "non_json_preamble"
+                        failure_reason = err_msg
+                    elif "empty_response" in err_msg or not raw_response:
+                        failure_stage = "empty_response"
+                        failure_reason = err_msg
+                    elif isinstance(e, (ConnectionError, TimeoutError)):
+                        failure_stage = "api_level_error"
+                        failure_reason = err_msg
+                    else:
+                        failure_stage = "malformed_json"
+                        failure_reason = err_msg
+
+                if attempt < max_attempts:
+                    # Short backoff on API rate limit or transient errors
+                    if failure_stage == "api_level_error":
+                        time.sleep(1.0)
+
+                    truncated_reply = raw_response[:200] if raw_response else "empty / no response"
+                    if failure_stage == "illegal_token":
+                        correction = (
+                            f"Your previous reply was parsed, but the 'token' field was invalid ({failure_reason}). "
+                            f"You must pick an integer token ID from this exact list: {legal_moves}. "
+                            f"Reply again with ONLY a complete, valid JSON object."
+                        )
+                    else:
+                        correction = (
+                            f"Your previous reply could not be parsed as JSON. It was: {repr(truncated_reply)}. "
+                            f"Error: {failure_reason}. "
+                            f"Reply again with ONLY a complete, valid JSON object, no other text."
+                        )
+
+                    curr_usr_prompt = usr_prompt + "\n\n" + correction
+                    failure_stage = None
+                    failure_reason = None
+                else:
+                    if failure_stage is None:
+                        failure_stage = "retries_exhausted"
+
+        # If all 3 attempts failed, record and log failure stage
+        self.used_fallback = True
+        self.last_failure_stage = failure_stage or "retries_exhausted"
+        self.last_failure_reason = failure_reason or "All attempts failed"
+
+        print(
+            f"[Player {self.color}] Fallback move triggered for {self.model} "
+            f"(Failure stage: {self.last_failure_stage}). Reason: {self.last_failure_reason}"
+        )
+        if raw_response:
+            print(f"[Player {self.color}] Last raw response was: {repr(raw_response[:200])}")
+
+        token_choice = random.choice(legal_moves)
+        if not self.threats:
+            self.threats = "None."
+        if not self.opportunities:
+            self.opportunities = "Advance active token."
+        self.strategy = "Played the best available move."
 
         return board.move(token_choice)
 

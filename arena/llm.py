@@ -10,7 +10,7 @@ class LLM(ABC):
         self.model = model
 
     @abstractmethod
-    def chat(self, system: str, user: str, max_tokens: int = 600) -> str:
+    def chat(self, system: str, user: str, max_tokens: int = 1000) -> str:
         pass
 
     @classmethod
@@ -47,7 +47,7 @@ class GeminiLLM(LLM):
         super().__init__(model)
         self.api_key = os.getenv("GOOGLE_API_KEY")
 
-    def chat(self, system: str, user: str, max_tokens: int = 600) -> str:
+    def chat(self, system: str, user: str, max_tokens: int = 1000) -> str:
         if not self.api_key:
             raise ValueError("GOOGLE_API_KEY environment variable is not set.")
 
@@ -56,12 +56,21 @@ class GeminiLLM(LLM):
             from google.genai import types
             client = genai.Client(api_key=self.api_key)
             prompt = f"{system}\n\n{user}"
+            gen_cfg = {"max_output_tokens": max_tokens}
+            if hasattr(types, "ThinkingConfig"):
+                try:
+                    gen_cfg["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+                except Exception:
+                    pass
             response = client.models.generate_content(
                 model=self.model,
                 contents=prompt,
-                config=types.GenerateContentConfig(max_output_tokens=max_tokens)
+                config=types.GenerateContentConfig(**gen_cfg)
             )
-            return response.text
+            content = response.text
+            if not content:
+                raise ValueError("Gemini returned empty response text.")
+            return content
         except Exception as e:
             try:
                 from openai import OpenAI
@@ -77,7 +86,10 @@ class GeminiLLM(LLM):
                     ],
                     max_tokens=max_tokens
                 )
-                return response.choices[0].message.content
+                content = response.choices[0].message.content
+                if not content:
+                    raise ValueError("Gemini (OpenAI compatibility) returned empty response.")
+                return content
             except Exception:
                 raise e
 
@@ -87,7 +99,7 @@ class GroqLLM(LLM):
         super().__init__(model)
         self.api_key = os.getenv("GROQ_API_KEY")
 
-    def chat(self, system: str, user: str, max_tokens: int = 600) -> str:
+    def chat(self, system: str, user: str, max_tokens: int = 1000) -> str:
         if not self.api_key:
             raise ValueError("GROQ_API_KEY environment variable is not set.")
 
@@ -102,7 +114,10 @@ class GroqLLM(LLM):
                 ],
                 max_tokens=max_tokens
             )
-            return response.choices[0].message.content
+            content = response.choices[0].message.content
+            if not content:
+                raise ValueError("Groq returned empty response content.")
+            return content
         except Exception as e:
             try:
                 from openai import OpenAI
@@ -118,7 +133,10 @@ class GroqLLM(LLM):
                     ],
                     max_tokens=max_tokens
                 )
-                return response.choices[0].message.content
+                content = response.choices[0].message.content
+                if not content:
+                    raise ValueError("Groq fallback returned empty response.")
+                return content
             except Exception:
                 raise e
 
@@ -128,7 +146,7 @@ class OpenRouterLLM(LLM):
         super().__init__(model)
         self.api_key = os.getenv("OPENROUTER_API_KEY")
 
-    def chat(self, system: str, user: str, max_tokens: int = 600) -> str:
+    def chat(self, system: str, user: str, max_tokens: int = 1000) -> str:
         if not self.api_key:
             raise ValueError("OPENROUTER_API_KEY environment variable is not set.")
 
@@ -145,4 +163,7 @@ class OpenRouterLLM(LLM):
             ],
             max_tokens=max_tokens
         )
-        return response.choices[0].message.content
+        content = response.choices[0].message.content
+        if not content:
+            raise ValueError("OpenRouter returned empty response content.")
+        return content

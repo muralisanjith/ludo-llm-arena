@@ -60,8 +60,63 @@ class TestPlayer(unittest.TestCase):
         success = player.process_move(self.board)
         self.assertTrue(success)
         self.assertTrue(player.used_fallback)
+        self.assertEqual(player.last_failure_stage, "non_json_preamble")
         self.assertNotIn("fallback", player.strategy.lower())
         self.assertEqual(player.strategy, "Played the best available move.")
+
+    def test_markdown_fences_recovered(self):
+        player = Player(RED, "gemini-2.5-flash")
+        fenced_json = """```json
+{
+    "threats": "None",
+    "opportunities": "Move out of base",
+    "strategy": "Select token 0",
+    "token": 0
+}
+```"""
+        player.llm = MockLLM(fenced_json)
+        success = player.process_move(self.board)
+        self.assertTrue(success)
+        self.assertFalse(player.used_fallback)
+        self.assertEqual(player.strategy, "Select token 0")
+
+    def test_preamble_and_trailing_text_recovered(self):
+        player = Player(RED, "gemini-2.5-flash")
+        noisy_json = """Sure, here is my decision:
+{
+    "threats": "Blue token nearby",
+    "opportunities": "Safe square",
+    "strategy": "Select token 0",
+    "token": 0
+}
+Hope this helps!"""
+        player.llm = MockLLM(noisy_json)
+        success = player.process_move(self.board)
+        self.assertTrue(success)
+        self.assertFalse(player.used_fallback)
+        self.assertEqual(player.strategy, "Select token 0")
+
+    def test_retry_correction_success(self):
+        # First attempt returns invalid, second attempt returns valid
+        class MultiAttemptMockLLM(LLM):
+            def __init__(self):
+                super().__init__("mock-model")
+                self.calls = 0
+
+            def chat(self, system: str, user: str, max_tokens: int = 1000) -> str:
+                self.calls += 1
+                if self.calls == 1:
+                    return "Here is some invalid text"
+                return '{"threats": "None", "opportunities": "None", "strategy": "Move 0", "token": 0}'
+
+        player = Player(RED, "gemini-2.5-flash")
+        mock_llm = MultiAttemptMockLLM()
+        player.llm = mock_llm
+
+        success = player.process_move(self.board)
+        self.assertTrue(success)
+        self.assertFalse(player.used_fallback)
+        self.assertEqual(mock_llm.calls, 2)
 
 
 if __name__ == "__main__":

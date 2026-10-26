@@ -58,6 +58,37 @@ class TestUICallbacks(unittest.TestCase):
         blocked_game = model_callback(RED, self.game, "gemini-2.5-flash")
         self.assertEqual(blocked_game.players[RED].model, "gpt-oss-20b (Groq)")
 
+    def test_wait_with_stop_check(self):
+        import time
+        from arena.ludo import wait_with_stop_check
+        # When game is stopped, wait_with_stop_check returns True immediately without sleeping full duration
+        self.game.stopped = True
+        t0 = time.time()
+        stopped = wait_with_stop_check(self.game, 1.2, step=0.1)
+        self.assertTrue(stopped)
+        self.assertLess(time.time() - t0, 0.2)
+
+    def test_run_callback_frame_sequencing(self):
+        from arena.ludo import run_callback
+        # Mock players to avoid real API calls in quick loop test
+        for p in self.game.players.values():
+            p.process_move = lambda board: board.move(board.legal_moves()[0]) if board.legal_moves() else False
+
+        # Run generator and capture first yield (which must be dice roll frame)
+        gen = run_callback(self.game)
+        first_frame = next(gen)
+        # In first frame, dice must be rolled
+        game_out, svg_out, msg_out = first_frame[0], first_frame[1], first_frame[2]
+        self.assertIsNotNone(game_out.board.dice)
+        self.assertTrue(game_out.is_rolling)
+
+        # Stop game and verify it halts cleanly
+        self.game.stopped = True
+        # Drain generator
+        for _ in gen:
+            pass
+        self.assertFalse(self.game.is_running)
+
 
 if __name__ == "__main__":
     unittest.main()

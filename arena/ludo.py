@@ -76,11 +76,26 @@ def move_callback(game):
     return load_callback(game)
 
 
+def wait_with_stop_check(game, duration: float, step: float = 0.1) -> bool:
+    """Sleep for duration in small steps, returning True immediately if game is stopped."""
+    elapsed = 0.0
+    while elapsed < duration:
+        if getattr(game, "stopped", False):
+            return True
+        chunk = min(step, duration - elapsed)
+        time.sleep(chunk)
+        elapsed += chunk
+    return getattr(game, "stopped", False)
+
+
 def run_callback(game):
     game.is_running = True
     game.stopped = False
     while game.board.is_active() and not game.stopped:
-        game.move()
+        # Step (a): Roll the dice
+        game.roll()
+
+        # Step (b): Yield dice-roll frame to UI so dice animation & value are visibly displayed
         g, svg, msg, red_th, green_th, yellow_th, blue_th, records, ratings = load_callback(game)
         yield (
             g, svg, msg, red_th, green_th, yellow_th, blue_th, records, ratings,
@@ -88,11 +103,33 @@ def run_callback(game):
             gr.update(interactive=False), gr.update(interactive=False),
             gr.update(interactive=False), gr.update(interactive=False)
         )
-        if game.stopped:
+
+        # Step 2 & 4: Unconditional minimum hold for dice roll visibility (1.2s)
+        # Checked in 0.1s increments so Stop Game responds instantly
+        if wait_with_stop_check(game, 1.2, step=0.1):
             break
-        time.sleep(0.6)
+
+        if not game.board.is_active():
+            break
+
+        # Step (c) & (d): Call LLM for move decision and apply move
+        game.resolve_move()
+
+        # Step (e): Yield post-move frame showing updated token positions and thoughts
+        g, svg, msg, red_th, green_th, yellow_th, blue_th, records, ratings = load_callback(game)
+        yield (
+            g, svg, msg, red_th, green_th, yellow_th, blue_th, records, ratings,
+            gr.update(interactive=False), gr.update(interactive=True),
+            gr.update(interactive=False), gr.update(interactive=False),
+            gr.update(interactive=False), gr.update(interactive=False)
+        )
+
+        # Step 3 & 4: Post-move frame hold (0.6s) before next player's roll
+        if wait_with_stop_check(game, 0.6, step=0.1):
+            break
 
     game.is_running = False
+    game.is_rolling = False
     g, svg, msg, red_th, green_th, yellow_th, blue_th, records, ratings = load_callback(game)
     yield (
         g, svg, msg, red_th, green_th, yellow_th, blue_th, records, ratings,
